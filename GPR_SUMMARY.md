@@ -4,152 +4,135 @@
 
 该库通过 `code/data.py` 和 `code/data_augmention_loader_ori.py` 等文件实现了针对 GPR 数据的加载、预处理和增强。
 
-### 多视图数据配对与加载
-*   **配对逻辑**: 针对 GPR 数据通常包含不同视图（如 B-scan 侧视图和 C-scan 顶视图）的特性，代码实现了严格的文件名匹配逻辑（如 `find_indices_both_views` 函数），将同一检测点的“顶视图”（Top View, `_h.png`）与“主视图”（Main View, `_v.png`）进行配对加载。
+### 多视图数据配对与标签融合
+针对 GPR 数据通常包含不同视图（如 B-scan 侧视图和 C-scan 顶视图）的特性，代码实现了严格的文件名匹配逻辑。同时，为了处理不同视图对同一病害的不同表现，实现了标签融合逻辑 `get_problem`。
+
+*   **配对逻辑**: `find_indices_both_views` 函数将同一检测点的“顶视图”（`_h.png`）与“主视图”（`_v.png`）进行配对。
+*   **标签映射**: 通过 `get_problem` 函数将两个视图的原始分类标签映射为最终的 4 类病害标签（0: 空洞, 1: 层间脱空, 2: 裂缝, 3: 正常）。
 
 ```python
 # code/data.py
 
-def find_indices_both_views(data_dir, indices, dataset_topview, dataset_mainview):
-    indices_img_v, indices_img_h = [], []
-    top_path, main_path = [], []
-    for i in indices:
-        img_name = str(i + 1)
-        # 构建主视图和顶视图的文件路径
-        img_tuple_0_v = (os.path.join(data_dir, "1_mainview", "0_双曲线", img_name + "_v.png"), 0)
-        img_tuple_0_h = (os.path.join(data_dir, "0_topview", "0_平行线", img_name + "_h.png"), 0)
-        # ... (省略部分代码) ...
-        
-        # 在数据集中查找对应的索引
-        if img_tuple_0_v in dataset_mainview.imgs:
-            img_indice_v = dataset_mainview.imgs.index(img_tuple_0_v)
-            main_path.append(img_tuple_0_v)
-        # ...
-        
-        indices_img_v.append(img_indice_v)
-        indices_img_h.append(img_indice_h)
-
-    return [indices_img_h, indices_img_v], [top_path, main_path]
+def get_problem(top_view_type, main_view_type):
+    # main_view_type: 0_双曲线, 1_高亮, 2_正常
+    # top_view_type: 0_平行线, 1_暗斑, 2_亮斑, 3_正常
+    
+    problems = ['空洞', '层间脱空', '裂缝', '正常']
+    # 优先级判定逻辑：
+    if main_view_type == 1: # 主视图为“高亮” -> 判定为 0: 空洞
+        return 0
+    else:
+        if top_view_type == 1 or top_view_type == 2: # 顶视图为“暗斑”或“亮斑” -> 判定为 1: 层间脱空
+            return 1
+        elif top_view_type == 0: # 顶视图为“平行线” -> 判定为 2: 裂缝
+            return 2
+        else:
+            return 3 # 正常
 ```
 
 ### GPR 特有的数据增强
-*   **噪声模拟**: 针对雷达信号易受干扰的特点，实现了 `AddPepperNoise` (椒盐噪声) 和 `Gaussian_noise` (高斯噪声) 类，用于模拟地下介质不均匀性或设备噪声。
-*   **缺失模拟**: 实现了 `Cutout` 和 `HidePatch` 类，随机遮挡图像块，模拟信号丢失或局部数据不完整的情况。
+*   **物理噪声模拟**:
+    *   `AddPepperNoise`: 模拟椒盐噪声，模拟地下介质不均匀性产生的随机强反射点。
+    *   `Gaussian_noise`: 模拟高斯白噪声，模拟设备热噪声或背景干扰。
+*   **信号缺失模拟**:
+    *   `Cutout` / `HidePatch`: 随机遮挡图像块，模拟雷达信号在特定区域的丢失或严重衰减。
 
 ```python
 # code/data.py
-
 class AddPepperNoise(object):
     """增加椒盐噪声"""
     def __init__(self, snr, p=0.9):
-        assert isinstance(snr, float) and (isinstance(p, float))
-        self.snr = snr
-        self.p = p
-
+        # ...
     def __call__(self, img):
         if random.uniform(0, 1) < self.p:
-            img_ = np.array(img).copy()
-            h, w, c = img_.shape
-            signal_pct = self.snr
-            noise_pct = (1 - self.snr)
-            # 随机生成噪声掩码
+            # 随机生成噪声掩码，模拟信号坏点
             mask = np.random.choice((0, 1, 2), size=(h, w, 1), p=[signal_pct, noise_pct/2., noise_pct/2.])
-            mask = np.repeat(mask, c, axis=2)
-            img_[mask == 1] = 255   # 盐噪声
-            img_[mask == 2] = 0     # 椒噪声
-            return Image.fromarray(img_.astype('uint8')).convert('RGB')
-        else:
-            return img
+            # ...
+```
+
+*   **离线数据扩充**:
+    *   `augmention_dataset` 类支持在训练前对数据集进行倍增 (`aug_times`)。
+    *   在 `mode=2` (训练模式) 下，会对图像进行随机色调调整 (`adjust_hue`) 和高斯模糊 (`GaussianBlur`)，以增加样本多样性。
+
+```python
+# code/data_augmention_loader_ori.py
+class augmention_dataset(data.Dataset):
+    def maketraindata(self, repeat=0):
+        # 数据倍增逻辑，根据 repeat 次数生成不同的色调调整参数
+        if abs(repeat) > 0:
+            # ...
+            for y in range(...):
+                self.samples = self.samples + self.non_norm_sampling(...)
 ```
 
 ### 类别不平衡处理
-*   实现了 `up_sample` 函数，通过随机复制少数类样本来解决地下病害样本分布不均的问题。
-
-```python
-# code/data.py
-
-def up_sample(indices, classes):
-    max_num = max(classes)
-    up_indices = indices
-    up_classes = []
-    for i in range(len(classes)):
-        up_classes.append(classes[i] + up_classes[i - 1]) if up_classes else up_classes.append(classes[i])
-        if classes[i] < max_num:
-            # 随机选择样本进行复制，直到数量达到 max_num
-            index = np.random.randint(classes[i], size=(max_num - classes[i]))
-            for item in index:
-                up_indices.append(indices[item + up_classes[i - 1]]) if i > 0 else up_indices.append(indices[item])
-    return up_indices
-```
+*   `up_sample`: 通过随机复制少数类样本（如“空洞”样本通常较少）来平衡训练集分布，防止模型偏向于“正常”类别。
 
 ## 2. 针对 GPR 特性的代码模型适配 (Model Adaptations)
 
-该库在 `models/densenet_MVFD.py` 中实现了专门的 **FusionDenseNet** 模型，并在 `code/train_DenseNet121_MVFD.py` 中实现了相应的训练策略，以适应 GPR 的多视图特性。
+该库在 `models/densenet_MVFD.py` 中实现了专门的 **FusionDenseNet** 模型，并在 `code/train_DenseNet121_MVFD.py` 中实现了相应的训练策略。
 
-### 双分支网络架构与图注意力融合
-*   **双分支**: 模型包含 `dn1` 和 `dn2` 两个 DenseNet 分支。
-*   **注意力融合**: 使用 `GAT` 模块计算权重，融合两个视图的特征。
+### 双分支网络架构与图注意力融合 (GAT Fusion)
+模型包含两个独立的 DenseNet 分支，分别处理顶视图和主视图。在特征提取末端，使用图注意力机制动态计算融合权重，从而自适应地利用不同视图的信息。
+
+*   `mean_att`: 计算两个视图特征的注意力权重。
+*   `FusionDenseNet`: 结合两个分支的特征和权重进行加权融合。
 
 ```python
 # models/densenet_MVFD.py
-
-class FusionDenseNet(nn.Module):
-    def __init__(self, growth_rate, block_config, num_init_features, num_classes, **kwargs):
-        super(FusionDenseNet, self).__init__()
-        # 双分支 DenseNet
-        self.dn1 = DenseNet(growth_rate, block_config, num_init_features, num_classes=num_classes, **kwargs)
-        self.dn2 = DenseNet(growth_rate, block_config, num_init_features, num_classes=num_classes, **kwargs)
-        
-        # 融合层与分类器
-        self.classifier = nn.Linear(1024, 100)
-        self.classifier2 = nn.Linear(100, num_classes)
-        self.gat = GAT(1024, 3) # 图注意力网络
-
-    def forward(self, x, y):
-        out_x, x = self.dn1(x) # 顶视图特征提取
-        w_x = self.gat(x)      # 计算注意力权重
-        out_y, y = self.dn2(y) # 主视图特征提取
-        w_y = self.gat(y)
-        
-        # 融合注意力权重
-        attention_merged = mean_att(w_x, w_y)
+def mean_att(x: Tensor, y: Tensor) -> Tensor:
+    # x, y shape: [batch, features]
+    # 对特征进行拼接并计算 softmax 权重
+    betas_x, betas_y = [], []
+    for idx in range(3): # 假设有3个注意力头
+        weight_x_temp, weight_y_temp = x[:, idx].view(-1, 1), y[:, idx].view(-1, 1)
+        attention_merged = torch.cat((weight_x_temp, weight_y_temp), 1)
+        attention_merged = torch.softmax(attention_merged, dim=1)
         beta_x, beta_y = attention_merged.split(1, dim=1)
-        
-        # 加权融合特征
-        layer_merged = beta_x * x + beta_y * y
-        layer_merged = torch.flatten(layer_merged, 1)
-        
-        out = self.classifier(layer_merged)
-        out = self.relu(out)
-        out = self.classifier2(out)
-        return out, out_x, out_y
+        betas_x.append(beta_x)
+        betas_y.append(beta_y)
+    
+    # 取平均作为最终权重
+    beta_x_mean = torch.mean(torch.cat(betas_x, dim=1), dim=1).view(-1, 1)
+    beta_y_mean = torch.mean(torch.cat(betas_y, dim=1), dim=1).view(-1, 1)
+    return torch.cat((beta_x_mean, beta_y_mean), dim=1)
 ```
 
 ### 切换式在线知识蒸馏 (SwitOKD)
-*   **动态蒸馏**: 根据各分支和融合分支的预测置信度（通过 `epsilon` 和 `delta` 动态阈值判断），决定反向传播的 Loss 构成。
-*   **互相指导**: 表现好的分支会指导表现差的分支（通过 KL 散度）。
+为了解决多视图融合中单一视图分支可能训练不足的问题，采用了“切换式在线知识蒸馏”策略。模型会动态评估主视图、顶视图和融合视图的置信度，并让表现好的视图“指导”表现差的视图。
+
+*   **动态阈值**: 计算 `epsilon` 和 `delta`，衡量视图预测与 Ground Truth 之间的距离差异。
+*   **相互蒸馏**: 根据阈值判定，选择性地将 KL 散度损失 (`kl_div`) 加入到总损失中。
 
 ```python
 # code/train_DenseNet121_MVFD.py
 
-# ... (计算 outputs 和 one-hot labels) ...
+# 距离度量函数
+def dist_s_label(y, q): # 学生与标签的距离 (L1)
+    q = F.softmax(q, dim=-1)
+    dist = torch.sum(torch.abs(q - y), 1)
+    return torch.mean(dist)
 
-# 动态计算阈值
+def dist_s_t(p_logit, q_logit, T): # 学生与教师的距离 (L1 of Softmax)
+    # ...
+    dist = torch.sum(torch.abs(q - p), 1)
+    return torch.mean(dist)
+
+# 训练循环中的逻辑
+# ...
 epsilon = torch.exp(-1 * top_label / (main_label + top_label))
 delta = main_label - epsilon * top_label
-epsilon1 = torch.exp(-1 * fusion_label / (main_label + fusion_label))
-delta1 = main_label - epsilon1 * fusion_label
 # ...
 
-# 根据阈值判断当前样本应该优化哪些分支，以及谁指导谁
+# 经典四步判断 (Classic Four Steps)
 if (pmain_ptop > delta and top_label < main_label) and ...:
-    # 例如：主视图表现好，用主视图指导其他分支
+    # 场景1: 主视图优于顶视图，且融合视图也表现良好 -> 主视图作为教师指导其他
     loss_main = criterion(outs_main, problems_label_torch) + \
                 (kl_div(outs_top.detach(), outs_main) * 1 + kl_div(outs_fusion.detach(), outs_main)) * 1
     loss = loss_main
     loss.backward()
     optimizer_main.step()
 elif ...:
-    # 其他情况的蒸馏逻辑
-    # ...
+    # 场景2/3/4: 根据相对性能，动态调整谁作为教师(Teacher)，谁作为学生(Student)
+    # 从而实现 Top View, Main View, Fusion View 三者之间的相互促进
 ```
